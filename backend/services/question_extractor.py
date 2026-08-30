@@ -1,82 +1,101 @@
-import os
-import json
-
-from google import genai
-from google.genai import types
-
-from dotenv import load_dotenv
+import re
 
 
-load_dotenv()
-
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-
-def extract_questions(page_images):
+def extract_questions(page_texts):
     questions = []
+    full_text = ""
 
-    for page_data in page_images:
+    for page_data in page_texts:
         page_number = page_data["page"]
-        image_bytes = page_data["image"]
+        text = page_data.get("text", "")
+        full_text += f"\n[[PAGE:{page_number}]]\n"
+        full_text += text
 
-        prompt = """
-Extract every question from this question paper page.
+    section_a_matches = list(re.finditer(r"\bSection\s+A\b",full_text,flags=re.IGNORECASE))
 
-Rules:
+    if len(section_a_matches) >= 2:
+        question_text = full_text[section_a_matches[1].end():]
+    else:
+        question_text = full_text
 
-1. Preserve the exact original question numbering.
-2. Keep questions in the same printed order.
-3. Treat labelled sub-parts as separate questions.
+    pattern = re.compile(r"(?m)^\s*(\d{1,2})\.\s*")
+    matches = list(pattern.finditer(question_text))
 
-Example:
-11(a) must be one question.
-11(b) must be another question.
+    for index, match in enumerate(matches):
+        number = match.group(1)
+        number_int = int(number)
 
-4. Do not change question numbers.
-5. Do not create questions that are not visible.
-6. If marks are visible, extract them.
-7. Return only valid JSON.
+        if number_int < 1 or number_int > 38:
+            continue
 
-Return this format:
+        start = match.end()
 
-{
-    "questions": [
-        {
-            "number": "1",
-            "text": "question text",
-            "marks": 2
-        },
-        {
-            "number": "11(a)",
-            "text": "question text",
-            "marks": 3
-        }
-    ]
-}
+        if index + 1 < len(matches):
+            end = matches[index + 1].start()
+        else:
+            end = len(question_text)
 
-If marks are not visible, use null.
-"""
+        raw_question = question_text[start:end]
+        before_question = question_text[:match.start()]
+        page_matches = re.findall(r"\[\[PAGE:(\d+)\]\]",before_question)
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                prompt,
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/png"
-                )
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+        page_number = (
+            int(page_matches[-1])
+            if page_matches
+            else 1
         )
 
-        data = json.loads(response.text)
+        text = clean_question_text(raw_question)
 
-        for question in data.get("questions", []):
-            question["page"] = page_number
-            question["order"] = len(questions) + 1
+        if not text:
+            continue
 
-            questions.append(question)
+        if any(q["number"] == number for q in questions):
+            continue
+
+        questions.append({
+            "number": number,
+            "text": text,
+            "marks": get_default_marks(number_int),
+            "page": page_number,
+            "order": len(questions) + 1,
+        })
 
     return questions
+
+
+def clean_question_text(text):
+    text = re.sub(r"\[\[PAGE:\d+\]\]", "", text)
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+
+    lines = []
+
+    for line in text.split("\n"):
+        line = line.strip()
+
+        if line:
+            lines.append(line)
+
+    text = " ".join(lines)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+(?:1\s+1\s+2|1\s+1\s+2\s+2)$", "", text)
+    return text.strip()
+
+def get_default_marks(number):
+    if 1 <= number <= 20:
+        return 1
+
+    if 21 <= number <= 25:
+        return 2
+
+    if 26 <= number <= 31:
+        return 3
+
+    if 32 <= number <= 35:
+        return 5
+
+    if 36 <= number <= 38:
+        return 4
+
+    return None
